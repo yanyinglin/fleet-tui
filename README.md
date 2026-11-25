@@ -49,10 +49,15 @@ Code panes.
 | idle | an agent pane that matches neither |
 | sh | no agent in the pane |
 
-**IDLE** is the time since the agent's last turn ended, read from the `· done HH:MM` stamp Claude Code prints
-under a finished turn. tmux's own activity time is used only when no stamp is on screen or the session has been quiet
-for over a day, because every status-line redraw or toast resets it. A working session shows `-`. Panes parked on the
-agent list screen keep redrawing, so their IDLE stays near 0.
+**IDLE** is the time since the session's last model response, read from the tail of its transcript
+(`~/.claude/sessions/<pid>.json` gives the session id, `~/.claude/projects/*/<id>.jsonl` the transcript). Without a
+transcript it falls back to the `· done HH:MM` stamp under the last finished turn, then to tmux's activity time, which
+every status-line redraw resets. A working session shows `-`.
+
+**CACHE** is the time left before the session's prompt cache expires, counted from that last model response. Claude
+Code asks for a 1-hour cache, which drops to 5 minutes once the account is in usage overage (5-hour quota at 100 %);
+`cache_ttl` / `FLEET_CACHE_TTL` (seconds) overrides it. `live` means the session is working, `cold` that the cache has
+expired, so the next turn rewrites the whole context at full price. Yellow under 15 minutes, red under 5.
 
 **JOBS** counts the commands the agent is running right now, read from the process tree under the pane (`ps`): each
 Bash tool call, foreground or background, and any other child process except MCP servers. The panel above the
@@ -72,6 +77,7 @@ Settings live in `~/.config/fleet/config` as `key=value` lines. An environment v
 |---|---|---|
 | `pinned` | `FLEET_PINNED` | comma-separated session names shown as status lights in the header and marked `◆` in the table |
 | `workspace` | `FLEET_WORKSPACE` | directory prefix shortened to `~w` |
+| `cache_ttl` | `FLEET_CACHE_TTL` | prompt-cache lifetime in seconds (default 3600, 300 in overage) |
 | `rate_file` | `FLEET_RATE_FILE` | quota reading, default `~/.claude/rate-limits.json` |
 
 Two columns need help from your Claude Code status line, and stay blank without it.

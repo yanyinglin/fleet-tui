@@ -31,6 +31,7 @@ struct Config {
     pinned: Vec<String>,
     workspace: String,
     rate_file: String,
+    cache_ttl: Option<u64>,
     home: String,
 }
 
@@ -52,6 +53,7 @@ fn cfg() -> &'static Config {
         Config {
             pinned: get("pinned", "FLEET_PINNED").split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect(),
             workspace: get("workspace", "FLEET_WORKSPACE").trim_end_matches('/').to_string(),
+            cache_ttl: get("cache_ttl", "FLEET_CACHE_TTL").parse().ok(),
             rate_file: if rate.is_empty() { format!("{home}/.claude/rate-limits.json") } else { rate },
             home,
         }
@@ -94,6 +96,86 @@ struct Row {
     last: String,
     subs: usize,
     jobs: Vec<Job>,
+    /// seconds since the session's last model response, the moment its prompt cache was last written
+    since_api: Option<u64>,
+}
+
+/// Prompt-cache lifetime in seconds: Claude Code asks for a 1-hour TTL, which drops to 5 minutes once the account is
+/// in usage overage (5-hour quota at 100 %). Override with FLEET_CACHE_TTL / `cache_ttl` (seconds).
+fn cache_ttl(u: &Usage) -> u64 {
+    if let Some(v) = cfg().cache_ttl {
+        return v;
+    }
+    if u.pct.is_some_and(|p| p >= 100.0) { 300 } else { 3600 }
+}
+
+/// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// "2026-11-24T23:13:14.731Z" -> epoch seconds.
+fn parse_iso(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    if b.len() < 19 {
+        return None;
+    }
+    let n = |r: std::ops::Range<usize>| s.get(r).and_then(|x| x.parse::<i64>().ok());
+    let days = days_from_civil(n(0..4)?, n(5..7)?, n(8..10)?);
+    let secs = days * 86_400 + n(11..13)? * 3600 + n(14..16)? * 60 + n(17..19)?;
+    u64::try_from(secs).ok()
+}
+
+thread_local! {
+    static API_MEMO: std::cell::RefCell<HashMap<String, (u64, Option<u64>)>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// Claude Code registers each running session in `~/.claude/sessions/<pid>.json` with its sessionId; the transcript is
+/// `~/.claude/projects/<dir>/<sessionId>.jsonl`. Returns the epoch time of the last assistant entry, read from the
+/// file's tail only. Results are cached by (path, size) so an unchanged transcript is not reread.
+fn last_api(pid: u32) -> Option<u64> {
+    let home = &cfg().home;
+    let reg = std::fs::read_to_string(format!("{home}/.claude/sessions/{pid}.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&reg).ok()?;
+    let sid = v["sessionId"].as_str()?.to_string();
+    let path = std::fs::read_dir(format!("{home}/.claude/projects"))
+        .ok()?
+        .flatten()
+        .map(|e| e.path().join(format!("{sid}.jsonl")))
+        .find(|p| p.exists())?;
+    let key = path.to_string_lossy().into_owned();
+    let size = std::fs::metadata(&path).ok()?.len();
+    if let Some((s, t)) = API_MEMO.with(|m| m.borrow().get(&key).copied()) {
+        if s == size {
+            return t;
+        }
+    }
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(&path).ok()?;
+    let mut t = None;
+    // grow the tail window until an assistant entry is found (big tool results can push it back)
+    for win in [256_u64 << 10, 2 << 20, 16 << 20] {
+        let start = size.saturating_sub(win);
+        f.seek(SeekFrom::Start(start)).ok()?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).ok()?;
+        let txt = String::from_utf8_lossy(&buf);
+        t = txt
+            .lines()
+            .rev()
+            .filter(|l| l.contains("\"type\":\"assistant\""))
+            .find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok().and_then(|d| d["timestamp"].as_str().and_then(parse_iso)));
+        if t.is_some() || start == 0 {
+            break;
+        }
+    }
+    API_MEMO.with(|m| m.borrow_mut().insert(key, (size, t)));
+    t
 }
 
 /// A command the agent started that is still running: a Bash tool call (foreground or background) or another child.
@@ -314,7 +396,9 @@ fn collect(rx: &Rx, prev_subs: &mut HashMap<String, String>) -> Vec<Row> {
         // window_activity moves on every redraw (status line, toasts), so it understates idle time; prefer the
         // "· done HH:MM" stamp of the last finished turn when the pane shows one (see below).
         let mut idle = t.saturating_sub(p[1].parse::<u64>().unwrap_or(0));
-        let jobs = p.get(5).and_then(|x| x.parse::<u32>().ok()).and_then(|pp| ps.agent(pp)).map(|a| ps.jobs(a)).unwrap_or_default();
+        let agent_pid = p.get(5).and_then(|x| x.parse::<u32>().ok()).and_then(|pp| ps.agent(pp));
+        let jobs = agent_pid.map(|a| ps.jobs(a)).unwrap_or_default();
+        let since_api = agent_pid.and_then(last_api).map(|a| t.saturating_sub(a));
         let pane = capture(p[4], 40);
         let tail: Vec<&String> = pane.iter().rev().take(25).collect();
         let text = tail.iter().rev().map(|s| s.as_str()).collect::<Vec<_>>().join("\n");
@@ -348,6 +432,7 @@ fn collect(rx: &Rx, prev_subs: &mut HashMap<String, String>) -> Vec<Row> {
         };
         match st {
             St::Work => idle = 0,
+            St::Idle | St::Ask if since_api.is_some() => idle = since_api.unwrap_or(idle),
             St::Idle | St::Ask => {
                 if let Some(c) = spin.and_then(|l| done_at.captures(l)) {
                     let (hh, mm) = (c[1].parse().unwrap_or(0), c[2].parse().unwrap_or(0));
@@ -384,6 +469,7 @@ fn collect(rx: &Rx, prev_subs: &mut HashMap<String, String>) -> Vec<Row> {
             last,
             subs: subs.len(),
             jobs,
+            since_api,
         });
     }
     rows.sort_by(|a, b| (a.st, a.idle).cmp(&(b.st, b.idle)));
@@ -542,6 +628,21 @@ fn st_cell(r: &Row) -> Cell<'static> {
     Cell::from(txt).style(style)
 }
 
+/// Time left before the session's prompt cache expires; after that its next turn rewrites the whole context.
+fn cache_cell(r: &Row, ttl: u64) -> Cell<'static> {
+    let Some(since) = r.since_api else { return Cell::from("") };
+    let line = if r.st == St::Work {
+        Line::from("live").style(Style::new().fg(Color::LightGreen))
+    } else if since >= ttl {
+        Line::from("cold").style(Style::new().fg(Color::DarkGray))
+    } else {
+        let left = ttl - since;
+        let col = if left < 300 { Color::LightRed } else if left < 900 { Color::Yellow } else { Color::Cyan };
+        Line::from(age(left)).style(Style::new().fg(col))
+    };
+    Cell::from(line.alignment(Alignment::Right))
+}
+
 fn ctx_cell(c: Option<u16>) -> Cell<'static> {
     match c {
         None => Cell::from(""),
@@ -614,6 +715,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     );
 
     // session table
+    let ttl = cache_ttl(&app.usage);
     let rows: Vec<ratatui::widgets::Row> = app
         .shown
         .iter()
@@ -633,6 +735,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                 Cell::from(Line::from(if r.st == St::Work { "-".to_string() } else { age(r.idle) }).alignment(Alignment::Right)),
                 Cell::from(Line::from(if r.jobs.is_empty() { String::new() } else { r.jobs.len().to_string() }).alignment(Alignment::Right))
                     .style(Style::new().fg(Color::LightYellow)),
+                cache_cell(r, ttl),
                 ctx_cell(r.ctx),
                 Cell::from(format!("{}{}", if is_orch { "◆ " } else { "  " }, r.name)).style(name_style),
                 Cell::from(task).style(Style::new().fg(Color::Cyan)),
@@ -657,6 +760,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             Constraint::Length(7),
             Constraint::Length(5),
             Constraint::Length(4),
+            Constraint::Length(6),
             Constraint::Length(13),
             Constraint::Length(26),
             Constraint::Length(34),
@@ -664,7 +768,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         ],
     )
     .header(
-        ratatui::widgets::Row::new(["STATE", " IDLE", "JOBS", "CONTEXT", "  SESSION", "TASK", "LAST"])
+        ratatui::widgets::Row::new(["STATE", " IDLE", "JOBS", " CACHE", "CONTEXT", "  SESSION", "TASK", "LAST"])
             .style(Style::new().fg(Color::DarkGray).bold()),
     )
     .column_spacing(2)
