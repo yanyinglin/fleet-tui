@@ -63,11 +63,12 @@ expired, so the next turn rewrites the whole context at full price. Yellow under
 **PLAN** is the session's task list as `done/total`, green while a task is in progress. Claude Code keeps the list
 that TaskCreate and TaskUpdate maintain in `~/.claude/tasks/<sessionId>/<id>.json`. For the selected session a plan
 panel at the bottom right lists the tasks in order: `✓` done, `▶` in progress (its activeForm), `○` pending, scrolled to
-keep the current task in view. A session that never wrote a task list shows nothing there.
+keep the current task in view, with the running commands listed under it. A session that never wrote a task list
+shows only its running commands there.
 
 **JOBS** counts the commands the agent is running right now, read from the process tree under the pane (`ps`): each
-Bash tool call, foreground or background, and any other child process except MCP servers. The panel above the
-preview lists them with their age, the command (unwrapped from Claude Code's shell wrapper) and, after `→`, the
+Bash tool call, foreground or background, and any other child process except MCP servers. The panel under the
+plan lists them with their age, the command (unwrapped from Claude Code's shell wrapper) and, after `→`, the
 innermost process running under it at the moment. Processes that were detached from the agent (`nohup`, `setsid`,
 pods on other hosts) are not attributed to it.
 

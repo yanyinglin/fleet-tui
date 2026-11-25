@@ -840,64 +840,65 @@ fn draw(f: &mut Frame, app: &mut App) {
     .block(Block::bordered().title(title));
     f.render_stateful_widget(table, list, &mut app.table);
 
-    // running commands of the selected session, above its pane preview
-    let jobs: Vec<Job> = app.selected().map(|r| r.jobs.clone()).unwrap_or_default();
-    let prev = if jobs.is_empty() {
-        prev
-    } else {
-        let n = (jobs.len().min(6) as u16) + 2;
-        let [jb, rest] = Layout::vertical([Constraint::Length(n), Constraint::Min(3)]).areas(prev);
-        let mut jl: Vec<Line> = jobs
-            .iter()
-            .take(6)
-            .map(|j| {
-                let mut s = vec![
-                    Span::styled(format!("{:>5}  ", age(j.secs)), Style::new().fg(Color::LightYellow)),
-                    Span::styled(j.cmd.clone(), Style::new().fg(Color::White)),
-                ];
-                if !j.now.is_empty() {
-                    s.push(Span::styled(format!("   → {}", j.now), Style::new().fg(Color::DarkGray)));
-                }
-                Line::from(s)
-            })
-            .collect();
-        if jobs.len() > 6 {
-            jl.push(Line::styled(format!("  … {} more", jobs.len() - 6), Style::new().fg(Color::DarkGray)));
-        }
-        f.render_widget(
-            Paragraph::new(jl).block(Block::bordered().title(format!(" running commands · {} ", jobs.len()))),
-            jb,
-        );
-        rest
-    };
-
-    // task plan of the selected session, at the right of the pane preview
+    // right column beside the pane preview: the task plan on top, running commands below it
     let plan: Vec<Task> = app.selected().map(|r| r.plan.clone()).unwrap_or_default();
-    let prev = if plan.is_empty() {
+    let jobs: Vec<Job> = app.selected().map(|r| r.jobs.clone()).unwrap_or_default();
+    let prev = if plan.is_empty() && jobs.is_empty() {
         prev
     } else {
-        let [left, right] = Layout::horizontal([Constraint::Min(40), Constraint::Percentage(38)]).areas(prev);
-        let h = right.height.saturating_sub(2) as usize;
-        // keep the current task in view: start a little above the first unfinished one
-        let first_open = plan.iter().position(|t| t.status != "completed").unwrap_or(plan.len().saturating_sub(1));
-        let start = first_open.saturating_sub(2).min(plan.len().saturating_sub(h));
-        let pl: Vec<Line> = plan[start..]
-            .iter()
-            .take(h)
-            .map(|t| match t.status.as_str() {
-                "completed" => Line::styled(format!("✓ {}", t.subject), Style::new().fg(Color::DarkGray)),
-                "in_progress" => Line::styled(
-                    format!("▶ {}", if t.active.is_empty() { &t.subject } else { &t.active }),
-                    Style::new().fg(Color::LightGreen).bold(),
-                ),
-                _ => Line::styled(format!("○ {}", t.subject), Style::new().fg(Color::White)),
-            })
-            .collect();
-        let done = plan.iter().filter(|t| t.status == "completed").count();
-        f.render_widget(
-            Paragraph::new(pl).wrap(Wrap { trim: true }).block(Block::bordered().title(format!(" plan · {done}/{} ", plan.len()))),
-            right,
-        );
+        let [left, right] = Layout::horizontal([Constraint::Min(40), Constraint::Percentage(40)]).areas(prev);
+        let jobs_h = if jobs.is_empty() { 0 } else { (jobs.len().min(6) as u16) + 2 + u16::from(jobs.len() > 6) };
+        let [plan_area, jobs_area] = if plan.is_empty() {
+            [Rect::default(), right]
+        } else {
+            Layout::vertical([Constraint::Min(4), Constraint::Length(jobs_h)]).areas(right)
+        };
+        if !plan.is_empty() {
+            let h = plan_area.height.saturating_sub(2) as usize;
+            // keep the current task in view: start a little above the first unfinished one
+            let first_open = plan.iter().position(|t| t.status != "completed").unwrap_or(plan.len().saturating_sub(1));
+            let start = first_open.saturating_sub(2).min(plan.len().saturating_sub(h));
+            let pl: Vec<Line> = plan[start..]
+                .iter()
+                .take(h)
+                .map(|t| match t.status.as_str() {
+                    "completed" => Line::styled(format!("✓ {}", t.subject), Style::new().fg(Color::DarkGray)),
+                    "in_progress" => Line::styled(
+                        format!("▶ {}", if t.active.is_empty() { &t.subject } else { &t.active }),
+                        Style::new().fg(Color::LightGreen).bold(),
+                    ),
+                    _ => Line::styled(format!("○ {}", t.subject), Style::new().fg(Color::White)),
+                })
+                .collect();
+            let done = plan.iter().filter(|t| t.status == "completed").count();
+            f.render_widget(
+                Paragraph::new(pl).block(Block::bordered().title(format!(" plan · {done}/{} ", plan.len()))),
+                plan_area,
+            );
+        }
+        if !jobs.is_empty() {
+            let mut jl: Vec<Line> = jobs
+                .iter()
+                .take(6)
+                .map(|j| {
+                    let mut s = vec![
+                        Span::styled(format!("{:>5}  ", age(j.secs)), Style::new().fg(Color::LightYellow)),
+                        Span::styled(j.cmd.clone(), Style::new().fg(Color::White)),
+                    ];
+                    if !j.now.is_empty() {
+                        s.push(Span::styled(format!("   → {}", j.now), Style::new().fg(Color::DarkGray)));
+                    }
+                    Line::from(s)
+                })
+                .collect();
+            if jobs.len() > 6 {
+                jl.push(Line::styled(format!("  … {} more", jobs.len() - 6), Style::new().fg(Color::DarkGray)));
+            }
+            f.render_widget(
+                Paragraph::new(jl).block(Block::bordered().title(format!(" running commands · {} ", jobs.len()))),
+                jobs_area,
+            );
+        }
         left
     };
 
