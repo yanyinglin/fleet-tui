@@ -100,6 +100,51 @@ struct Row {
     since_api: Option<u64>,
     /// the pane shows Claude Code's agent list ("describe a task for a new session"), not a conversation
     listing: bool,
+    /// the session's task list (TaskCreate / TaskUpdate), oldest first
+    plan: Vec<Task>,
+}
+
+#[derive(Clone)]
+struct Task {
+    status: String,
+    subject: String,
+    active: String,
+}
+
+/// Session id of a running Claude Code process, from `~/.claude/sessions/<pid>.json`.
+fn session_id(pid: u32) -> Option<String> {
+    let reg = std::fs::read_to_string(format!("{}/.claude/sessions/{pid}.json", cfg().home)).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&reg).ok()?;
+    v["sessionId"].as_str().map(|s| s.to_string())
+}
+
+/// Claude Code keeps each session's task list as `~/.claude/tasks/<sessionId>/<id>.json`.
+fn plan_of(sid: &str) -> Vec<Task> {
+    let mut v: Vec<(u64, Task)> = std::fs::read_dir(format!("{}/.claude/tasks/{sid}", cfg().home))
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| {
+                    if e.path().extension().and_then(|x| x.to_str()) != Some("json") {
+                        return None;
+                    }
+                    let d: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(e.path()).ok()?).ok()?;
+                    d["subject"].as_str()?;
+                    let id = d["id"].as_str().and_then(|x| x.parse().ok()).unwrap_or(u64::MAX);
+                    let st = d["status"].as_str().unwrap_or("pending").to_string();
+                    if st == "deleted" {
+                        return None;
+                    }
+                    Some((id, Task {
+                        status: st,
+                        subject: d["subject"].as_str().unwrap_or("").to_string(),
+                        active: d["activeForm"].as_str().unwrap_or("").to_string(),
+                    }))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort_by_key(|x| x.0);
+    v.into_iter().map(|x| x.1).collect()
 }
 
 /// Prompt-cache lifetime in seconds: Claude Code asks for a 1-hour TTL, which drops to 5 minutes once the account is
@@ -142,9 +187,7 @@ thread_local! {
 /// file's tail only. Results are cached by (path, size) so an unchanged transcript is not reread.
 fn last_api(pid: u32) -> Option<u64> {
     let home = &cfg().home;
-    let reg = std::fs::read_to_string(format!("{home}/.claude/sessions/{pid}.json")).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&reg).ok()?;
-    let sid = v["sessionId"].as_str()?.to_string();
+    let sid = session_id(pid)?;
     let path = std::fs::read_dir(format!("{home}/.claude/projects"))
         .ok()?
         .flatten()
@@ -401,6 +444,7 @@ fn collect(rx: &Rx, prev_subs: &mut HashMap<String, String>) -> Vec<Row> {
         let agent_pid = p.get(5).and_then(|x| x.parse::<u32>().ok()).and_then(|pp| ps.agent(pp));
         let jobs = agent_pid.map(|a| ps.jobs(a)).unwrap_or_default();
         let since_api = agent_pid.and_then(last_api).map(|a| t.saturating_sub(a));
+        let plan = agent_pid.and_then(session_id).map(|sid| plan_of(&sid)).unwrap_or_default();
         let pane = capture(p[4], 40);
         let tail: Vec<&String> = pane.iter().rev().take(25).collect();
         let text = tail.iter().rev().map(|s| s.as_str()).collect::<Vec<_>>().join("\n");
@@ -475,6 +519,7 @@ fn collect(rx: &Rx, prev_subs: &mut HashMap<String, String>) -> Vec<Row> {
             jobs,
             since_api,
             listing,
+            plan,
         });
     }
     rows.sort_by(|a, b| (a.st, a.idle).cmp(&(b.st, b.idle)));
@@ -648,6 +693,17 @@ fn cache_cell(r: &Row, ttl: u64) -> Cell<'static> {
     Cell::from(line.alignment(Alignment::Right))
 }
 
+/// done/total of the session's task list; green while a task is in progress.
+fn plan_cell(r: &Row) -> Cell<'static> {
+    if r.plan.is_empty() {
+        return Cell::from("");
+    }
+    let done = r.plan.iter().filter(|t| t.status == "completed").count();
+    let live = r.plan.iter().any(|t| t.status == "in_progress");
+    let col = if live { Color::LightGreen } else if done == r.plan.len() { Color::DarkGray } else { Color::Gray };
+    Cell::from(Line::from(format!("{done}/{}", r.plan.len())).alignment(Alignment::Right)).style(Style::new().fg(col))
+}
+
 fn ctx_cell(c: Option<u16>) -> Cell<'static> {
     match c {
         None => Cell::from(""),
@@ -741,6 +797,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                 Cell::from(Line::from(if r.jobs.is_empty() { String::new() } else { r.jobs.len().to_string() }).alignment(Alignment::Right))
                     .style(Style::new().fg(Color::LightYellow)),
                 cache_cell(r, ttl),
+                plan_cell(r),
                 ctx_cell(r.ctx),
                 Cell::from(format!("{}{}", if is_orch { "◆ " } else { "  " }, r.name)).style(name_style),
                 Cell::from(task).style(Style::new().fg(Color::Cyan)),
@@ -766,6 +823,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             Constraint::Length(5),
             Constraint::Length(4),
             Constraint::Length(6),
+            Constraint::Length(5),
             Constraint::Length(13),
             Constraint::Length(26),
             Constraint::Length(34),
@@ -773,7 +831,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         ],
     )
     .header(
-        ratatui::widgets::Row::new(["STATE", " IDLE", "JOBS", " CACHE", "CONTEXT", "  SESSION", "TASK", "LAST"])
+        ratatui::widgets::Row::new(["STATE", " IDLE", "JOBS", " CACHE", " PLAN", "CONTEXT", "  SESSION", "TASK", "LAST"])
             .style(Style::new().fg(Color::DarkGray).bold()),
     )
     .column_spacing(2)
@@ -811,6 +869,36 @@ fn draw(f: &mut Frame, app: &mut App) {
             jb,
         );
         rest
+    };
+
+    // task plan of the selected session, at the right of the pane preview
+    let plan: Vec<Task> = app.selected().map(|r| r.plan.clone()).unwrap_or_default();
+    let prev = if plan.is_empty() {
+        prev
+    } else {
+        let [left, right] = Layout::horizontal([Constraint::Min(40), Constraint::Percentage(38)]).areas(prev);
+        let h = right.height.saturating_sub(2) as usize;
+        // keep the current task in view: start a little above the first unfinished one
+        let first_open = plan.iter().position(|t| t.status != "completed").unwrap_or(plan.len().saturating_sub(1));
+        let start = first_open.saturating_sub(2).min(plan.len().saturating_sub(h));
+        let pl: Vec<Line> = plan[start..]
+            .iter()
+            .take(h)
+            .map(|t| match t.status.as_str() {
+                "completed" => Line::styled(format!("✓ {}", t.subject), Style::new().fg(Color::DarkGray)),
+                "in_progress" => Line::styled(
+                    format!("▶ {}", if t.active.is_empty() { &t.subject } else { &t.active }),
+                    Style::new().fg(Color::LightGreen).bold(),
+                ),
+                _ => Line::styled(format!("○ {}", t.subject), Style::new().fg(Color::White)),
+            })
+            .collect();
+        let done = plan.iter().filter(|t| t.status == "completed").count();
+        f.render_widget(
+            Paragraph::new(pl).wrap(Wrap { trim: true }).block(Block::bordered().title(format!(" plan · {done}/{} ", plan.len()))),
+            right,
+        );
+        left
     };
 
     // preview of the selected pane

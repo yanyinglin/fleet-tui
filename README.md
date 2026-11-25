@@ -60,6 +60,11 @@ Code asks for a 1-hour cache, which drops to 5 minutes once the account is in us
 `cache_ttl` / `FLEET_CACHE_TTL` (seconds) overrides it. `live` means the session is working, `cold` that the cache has
 expired, so the next turn rewrites the whole context at full price. Yellow under 15 minutes, red under 5.
 
+**PLAN** is the session's task list as `done/total`, green while a task is in progress. Claude Code keeps the list
+that TaskCreate and TaskUpdate maintain in `~/.claude/tasks/<sessionId>/<id>.json`. For the selected session a plan
+panel at the bottom right lists the tasks in order: `✓` done, `▶` in progress (its activeForm), `○` pending, scrolled to
+keep the current task in view. A session that never wrote a task list shows nothing there.
+
 **JOBS** counts the commands the agent is running right now, read from the process tree under the pane (`ps`): each
 Bash tool call, foreground or background, and any other child process except MCP servers. The panel above the
 preview lists them with their age, the command (unwrapped from Claude Code's shell wrapper) and, after `→`, the
