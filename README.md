@@ -52,7 +52,8 @@ Code panes.
 **IDLE** is the time since the session's last model response, read from the tail of its transcript
 (`~/.claude/sessions/<pid>.json` gives the session id, `~/.claude/projects/*/<id>.jsonl` the transcript). Without a
 transcript it falls back to the `· done HH:MM` stamp under the last finished turn, then to tmux's activity time, which
-every status-line redraw resets. A working session shows `-`.
+every status-line redraw resets. A working session shows `-`. A pane parked on the agent list screen shows
+`list`: that screen animates its rows and has no turn of its own.
 
 **CACHE** is the time left before the session's prompt cache expires, counted from that last model response. Claude
 Code asks for a 1-hour cache, which drops to 5 minutes once the account is in usage overage (5-hour quota at 100 %);
