@@ -98,6 +98,8 @@ struct Row {
     jobs: Vec<Job>,
     /// seconds since the session's last model response, the moment its prompt cache was last written
     since_api: Option<u64>,
+    /// the pane shows Claude Code's agent list ("describe a task for a new session"), not a conversation
+    listing: bool,
 }
 
 /// Prompt-cache lifetime in seconds: Claude Code asks for a 1-hour TTL, which drops to 5 minutes once the account is
@@ -430,6 +432,8 @@ fn collect(rx: &Rx, prev_subs: &mut HashMap<String, String>) -> Vec<Row> {
         } else {
             St::Shell
         };
+        // the agent-list screen animates its rows, so tmux activity is always "now"; it has no turn of its own
+        let listing = tail.iter().take(8).any(|l| l.trim() == "❯ describe a task for a new session");
         match st {
             St::Work => idle = 0,
             St::Idle | St::Ask if since_api.is_some() => idle = since_api.unwrap_or(idle),
@@ -470,6 +474,7 @@ fn collect(rx: &Rx, prev_subs: &mut HashMap<String, String>) -> Vec<Row> {
             subs: subs.len(),
             jobs,
             since_api,
+            listing,
         });
     }
     rows.sort_by(|a, b| (a.st, a.idle).cmp(&(b.st, b.idle)));
@@ -732,7 +737,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             let task = if r.task.is_empty() { r.cwd.clone() } else { r.task.clone() };
             let row = ratatui::widgets::Row::new(vec![
                 st_cell(r),
-                Cell::from(Line::from(if r.st == St::Work { "-".to_string() } else { age(r.idle) }).alignment(Alignment::Right)),
+                Cell::from(Line::from(if r.listing { "list".to_string() } else if r.st == St::Work { "-".to_string() } else { age(r.idle) }).alignment(Alignment::Right)),
                 Cell::from(Line::from(if r.jobs.is_empty() { String::new() } else { r.jobs.len().to_string() }).alignment(Alignment::Right))
                     .style(Style::new().fg(Color::LightYellow)),
                 cache_cell(r, ttl),
