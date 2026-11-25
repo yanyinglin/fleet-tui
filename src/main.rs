@@ -9,6 +9,8 @@
 //!         `✻ Verbed for 12s`, or a listed subagent's timer moved since the last refresh.
 //!         A subagent list alone is not work: finished subagents stay listed with a frozen timer for days.
 //!   idle  an agent pane with neither; sh = no agent in the pane.
+//! IDLE = time since the last "· done HH:MM" turn stamp (tmux activity only as a fallback); JOBS = running child
+//! commands of the agent process, from one `ps` snapshot per refresh.
 use std::{
     collections::HashMap,
     io,
@@ -91,6 +93,123 @@ struct Row {
     ctx: Option<u16>,
     last: String,
     subs: usize,
+    jobs: Vec<Job>,
+}
+
+/// A command the agent started that is still running: a Bash tool call (foreground or background) or another child.
+#[derive(Clone)]
+struct Job {
+    secs: u64,
+    cmd: String,
+    /// the innermost process under the command right now (e.g. `sleep 300`, `python run.py`), if different
+    now: String,
+}
+
+/// One `ps` snapshot per refresh: pid -> (ppid, elapsed seconds, full command line).
+struct Procs {
+    info: HashMap<u32, (u32, u64, String)>,
+    kids: HashMap<u32, Vec<u32>>,
+}
+
+fn procs() -> Procs {
+    let mut info = HashMap::new();
+    let mut kids: HashMap<u32, Vec<u32>> = HashMap::new();
+    for l in sh(&["ps", "-eo", "pid=,ppid=,etimes=,args="]).lines() {
+        let mut it = l.split_whitespace();
+        let (Some(pid), Some(ppid), Some(et)) = (it.next(), it.next(), it.next()) else { continue };
+        let (Ok(pid), Ok(ppid), Ok(et)) = (pid.parse::<u32>(), ppid.parse::<u32>(), et.parse::<u64>()) else { continue };
+        let args = it.collect::<Vec<_>>().join(" ");
+        kids.entry(ppid).or_default().push(pid);
+        info.insert(pid, (ppid, et, args));
+    }
+    Procs { info, kids }
+}
+
+impl Procs {
+    fn args(&self, pid: u32) -> &str {
+        self.info.get(&pid).map(|x| x.2.as_str()).unwrap_or("")
+    }
+    fn children(&self, pid: u32) -> &[u32] {
+        self.kids.get(&pid).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+    /// The agent process in a pane: the first process at or below the pane's shell that runs claude, codex or cursor-agent.
+    fn agent(&self, root: u32) -> Option<u32> {
+        let mut stack = vec![root];
+        while let Some(p) = stack.pop() {
+            let a = self.args(p);
+            let exe = a.split_whitespace().next().unwrap_or("");
+            let base = exe.rsplit('/').next().unwrap_or("");
+            if matches!(base, "claude" | "codex" | "cursor-agent") || (base == "node" && a.contains("claude")) {
+                return Some(p);
+            }
+            stack.extend(self.children(p).iter().rev());
+        }
+        None
+    }
+    /// The deepest, newest process under `pid` (what the command is doing right now).
+    fn leaf(&self, mut pid: u32) -> u32 {
+        while let Some(&c) = self.children(pid).iter().max() {
+            pid = c;
+        }
+        pid
+    }
+    /// Commands the agent is running. MCP servers are skipped; Claude Code's shell wrapper is unwrapped to the
+    /// command inside its `eval '...'`.
+    fn jobs(&self, agent: u32) -> Vec<Job> {
+        let mut out = Vec::new();
+        for &c in self.children(agent) {
+            let a = self.args(c);
+            if a.contains("mcp-server") || a.contains("-mcp") || a.contains("/mcp") || a.contains("mcp_server") {
+                continue;
+            }
+            let cmd = unwrap_shell(a);
+            let lf = self.leaf(c);
+            let now = if lf == c { String::new() } else { self.args(lf).to_string() };
+            let now = if cmd.starts_with(&now) { String::new() } else { now };
+            out.push(Job { secs: self.info.get(&c).map(|x| x.1).unwrap_or(0), cmd, now });
+        }
+        out.sort_by_key(|j| j.secs);
+        out
+    }
+}
+
+/// Claude Code runs each Bash call as `zsh -c source <snapshot> ... && eval '<command>' < /dev/null && pwd -P >| ...`.
+/// Return the command inside eval, or the whole line for anything else.
+fn unwrap_shell(a: &str) -> String {
+    if let Some(i) = a.find("eval '") {
+        let rest = &a[i + 6..];
+        let end = rest.rfind("' < /dev/null").or_else(|| rest.rfind('\'')).unwrap_or(rest.len());
+        return rest[..end].replace("'\\''", "'").replace("'\"'\"'", "'").split_whitespace().collect::<Vec<_>>().join(" ");
+    }
+    a.to_string()
+}
+
+/// Seconds since local midnight offset: `date +%z` once, e.g. -0500 -> -18000.
+fn tz_offset() -> i64 {
+    static OFF: OnceLock<i64> = OnceLock::new();
+    *OFF.get_or_init(|| {
+        let z = sh(&["date", "+%z"]);
+        let z = z.trim();
+        if z.len() == 5 {
+            let sign = if z.starts_with('-') { -1 } else { 1 };
+            let h: i64 = z[1..3].parse().unwrap_or(0);
+            let m: i64 = z[3..5].parse().unwrap_or(0);
+            sign * (h * 3600 + m * 60)
+        } else {
+            0
+        }
+    })
+}
+
+/// Seconds since a local wall-clock time `HH:MM` that lies in the past 24 hours.
+fn since_clock(hh: u64, mm: u64, t: u64) -> u64 {
+    let local = t as i64 + tz_offset();
+    let today = local - local.rem_euclid(86_400);
+    let mut at = today + (hh * 3600 + mm * 60) as i64;
+    if at > local + 60 {
+        at -= 86_400;
+    }
+    (local - at).max(0) as u64
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -181,8 +300,10 @@ fn read_usage() -> Usage {
 }
 
 fn collect(rx: &Rx, prev_subs: &mut HashMap<String, String>) -> Vec<Row> {
-    let fmt = "#{session_name}\t#{window_activity}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_id}";
+    let fmt = "#{session_name}\t#{window_activity}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_id}\t#{pane_pid}";
     let t = now();
+    let ps = procs();
+    let done_at = Regex::new(r"· done (\d{1,2}):(\d{2})").unwrap();
     let mut seen = std::collections::HashSet::new();
     let mut rows = Vec::new();
     for line in sh(&["tmux", "list-panes", "-a", "-F", fmt]).lines() {
@@ -190,7 +311,10 @@ fn collect(rx: &Rx, prev_subs: &mut HashMap<String, String>) -> Vec<Row> {
         if p.len() < 5 || !seen.insert(p[0].to_string()) {
             continue;
         }
-        let idle = t.saturating_sub(p[1].parse::<u64>().unwrap_or(0));
+        // window_activity moves on every redraw (status line, toasts), so it understates idle time; prefer the
+        // "· done HH:MM" stamp of the last finished turn when the pane shows one (see below).
+        let mut idle = t.saturating_sub(p[1].parse::<u64>().unwrap_or(0));
+        let jobs = p.get(5).and_then(|x| x.parse::<u32>().ok()).and_then(|pp| ps.agent(pp)).map(|a| ps.jobs(a)).unwrap_or_default();
         let pane = capture(p[4], 40);
         let tail: Vec<&String> = pane.iter().rev().take(25).collect();
         let text = tail.iter().rev().map(|s| s.as_str()).collect::<Vec<_>>().join("\n");
@@ -222,6 +346,19 @@ fn collect(rx: &Rx, prev_subs: &mut HashMap<String, String>) -> Vec<Row> {
         } else {
             St::Shell
         };
+        match st {
+            St::Work => idle = 0,
+            St::Idle | St::Ask => {
+                if let Some(c) = spin.and_then(|l| done_at.captures(l)) {
+                    let (hh, mm) = (c[1].parse().unwrap_or(0), c[2].parse().unwrap_or(0));
+                    // the stamp has no date; beyond a day the tmux activity time is the better bound
+                    if idle < 86_400 {
+                        idle = since_clock(hh, mm, t);
+                    }
+                }
+            }
+            St::Shell => {}
+        }
         let skip = ["bypass permissions", "for shortcuts", "auto mode on", "Update installed", "| Ctx:"];
         let body: Vec<&str> = pane
             .iter()
@@ -246,6 +383,7 @@ fn collect(rx: &Rx, prev_subs: &mut HashMap<String, String>) -> Vec<Row> {
             ctx,
             last,
             subs: subs.len(),
+            jobs,
         });
     }
     rows.sort_by(|a, b| (a.st, a.idle).cmp(&(b.st, b.idle)));
@@ -492,7 +630,9 @@ fn draw(f: &mut Frame, app: &mut App) {
             let task = if r.task.is_empty() { r.cwd.clone() } else { r.task.clone() };
             let row = ratatui::widgets::Row::new(vec![
                 st_cell(r),
-                Cell::from(Line::from(age(r.idle)).alignment(Alignment::Right)),
+                Cell::from(Line::from(if r.st == St::Work { "-".to_string() } else { age(r.idle) }).alignment(Alignment::Right)),
+                Cell::from(Line::from(if r.jobs.is_empty() { String::new() } else { r.jobs.len().to_string() }).alignment(Alignment::Right))
+                    .style(Style::new().fg(Color::LightYellow)),
                 ctx_cell(r.ctx),
                 Cell::from(format!("{}{}", if is_orch { "◆ " } else { "  " }, r.name)).style(name_style),
                 Cell::from(task).style(Style::new().fg(Color::Cyan)),
@@ -516,6 +656,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         [
             Constraint::Length(7),
             Constraint::Length(5),
+            Constraint::Length(4),
             Constraint::Length(13),
             Constraint::Length(26),
             Constraint::Length(34),
@@ -523,7 +664,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         ],
     )
     .header(
-        ratatui::widgets::Row::new(["STATE", " IDLE", "CONTEXT", "  SESSION", "TASK", "LAST"])
+        ratatui::widgets::Row::new(["STATE", " IDLE", "JOBS", "CONTEXT", "  SESSION", "TASK", "LAST"])
             .style(Style::new().fg(Color::DarkGray).bold()),
     )
     .column_spacing(2)
@@ -531,6 +672,37 @@ fn draw(f: &mut Frame, app: &mut App) {
     .highlight_symbol("▌")
     .block(Block::bordered().title(title));
     f.render_stateful_widget(table, list, &mut app.table);
+
+    // running commands of the selected session, above its pane preview
+    let jobs: Vec<Job> = app.selected().map(|r| r.jobs.clone()).unwrap_or_default();
+    let prev = if jobs.is_empty() {
+        prev
+    } else {
+        let n = (jobs.len().min(6) as u16) + 2;
+        let [jb, rest] = Layout::vertical([Constraint::Length(n), Constraint::Min(3)]).areas(prev);
+        let mut jl: Vec<Line> = jobs
+            .iter()
+            .take(6)
+            .map(|j| {
+                let mut s = vec![
+                    Span::styled(format!("{:>5}  ", age(j.secs)), Style::new().fg(Color::LightYellow)),
+                    Span::styled(j.cmd.clone(), Style::new().fg(Color::White)),
+                ];
+                if !j.now.is_empty() {
+                    s.push(Span::styled(format!("   → {}", j.now), Style::new().fg(Color::DarkGray)));
+                }
+                Line::from(s)
+            })
+            .collect();
+        if jobs.len() > 6 {
+            jl.push(Line::styled(format!("  … {} more", jobs.len() - 6), Style::new().fg(Color::DarkGray)));
+        }
+        f.render_widget(
+            Paragraph::new(jl).block(Block::bordered().title(format!(" running commands · {} ", jobs.len()))),
+            jb,
+        );
+        rest
+    };
 
     // preview of the selected pane
     let h = prev.height.saturating_sub(2) as usize;

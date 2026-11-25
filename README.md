@@ -49,6 +49,17 @@ Code panes.
 | idle | an agent pane that matches neither |
 | sh | no agent in the pane |
 
+**IDLE** is the time since the agent's last turn ended, read from the `· done HH:MM` stamp Claude Code prints
+under a finished turn. tmux's own activity time is used only when no stamp is on screen or the session has been quiet
+for over a day, because every status-line redraw or toast resets it. A working session shows `-`. Panes parked on the
+agent list screen keep redrawing, so their IDLE stays near 0.
+
+**JOBS** counts the commands the agent is running right now, read from the process tree under the pane (`ps`): each
+Bash tool call, foreground or background, and any other child process except MCP servers. The panel above the
+preview lists them with their age, the command (unwrapped from Claude Code's shell wrapper) and, after `→`, the
+innermost process running under it at the moment. Processes that were detached from the agent (`nohup`, `setsid`,
+pods on other hosts) are not attributed to it.
+
 A subagent list alone does not count as work, because finished subagents stay listed with a frozen timer. Other agents
 (Codex, cursor-agent) are recognised as agent panes, but their working state is detected only through an
 `esc to interrupt` hint.
